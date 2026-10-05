@@ -21,6 +21,7 @@ import logging
 import os
 
 # Local
+from .html_report import render_tree_html
 from .import_tracker import track_module
 
 ## Main ########################################################################
@@ -86,6 +87,40 @@ def main():
         help="Show whether each dependency is optional or required",
     )
     parser.add_argument(
+        "--tree",
+        action="store_true",
+        default=False,
+        help=(
+            "Track and output the dependency tree (nodes + directed edges) as "
+            "JSON instead of the flattened dependency mapping"
+        ),
+    )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=None,
+        help=(
+            "With --tree, truncate the exported tree at this relative depth. "
+            "Frontier nodes are kept and marked as truncated. Use 0 to export "
+            "only the root node."
+        ),
+    )
+    parser.add_argument(
+        "--html",
+        default=None,
+        metavar="PATH",
+        help=(
+            "With --tree, also write a self-contained, openable HTML tree "
+            "report to the given file path"
+        ),
+    )
+    parser.add_argument(
+        "--include_stdlib",
+        action="store_true",
+        default=False,
+        help="With --tree, include standard-library modules as tree nodes",
+    )
+    parser.add_argument(
         "--log_level",
         "-l",
         default=os.environ.get("LOG_LEVEL", "warning"),
@@ -106,21 +141,32 @@ def main():
         log_level = int(args.log_level)
     logging.basicConfig(level=log_level)
 
-    # Perform the tracking and print out the output
-    print(
-        json.dumps(
-            track_module(
-                module_name=args.name,
-                package_name=args.package,
-                submodules=submodules,
-                track_import_stack=args.track_import_stack,
-                full_depth=args.full_depth,
-                detect_transitive=args.detect_transitive,
-                show_optional=args.show_optional,
-            ),
-            indent=args.indent,
-        )
+    # Perform the tracking. Tree tracking records raw edges and truncates only
+    # at export time so a single run can be rendered at different depths.
+    tracked = track_module(
+        module_name=args.name,
+        package_name=args.package,
+        submodules=submodules,
+        track_import_stack=args.track_import_stack,
+        full_depth=args.full_depth,
+        detect_transitive=args.detect_transitive,
+        show_optional=args.show_optional,
+        track_tree=args.tree,
+        max_depth=args.depth,
+        ignore_stdlib=not args.include_stdlib,
     )
+
+    # In tree mode the output is a structured tree; otherwise the flattened
+    # dependency mapping is printed.
+    print(json.dumps(tracked, indent=args.indent))
+
+    # Optionally write the self-contained HTML report
+    if args.html:
+        if not args.tree:
+            raise ValueError("--html requires --tree")
+        html_content = render_tree_html(tracked, title=f"Dependency Tree: {args.name}")
+        with open(args.html, "w", encoding="utf-8") as handle:
+            handle.write(html_content)
 
 
 if __name__ == "__main__":  # pragma: no cover

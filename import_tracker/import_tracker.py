@@ -13,6 +13,7 @@ import sys
 
 # Local
 from . import constants
+from .dependency_tree import DependencyTree, active_tree
 from .log import log
 
 ## Public ######################################################################
@@ -26,6 +27,9 @@ def track_module(
     full_depth: bool = False,
     detect_transitive: bool = False,
     show_optional: bool = False,
+    track_tree: bool = False,
+    max_depth: Optional[int] = constants.DEFAULT_MAX_DEPTH,
+    ignore_stdlib: bool = constants.IGNORE_STDLIB,
 ) -> Union[Dict[str, List[str]], Dict[str, Dict[str, Any]]]:
     """Track the dependencies of a single python module
 
@@ -51,6 +55,16 @@ def track_module(
         show_optional:  bool
             Show whether each requirement is optional (behind a try/except) or
             not
+        track_tree:  bool
+            Record a dependency tree (nodes + directed, de-duplicated edges)
+            and return it instead of the flattened dependency mapping.
+        max_depth:  Optional[int]
+            Truncate the exported tree at this relative depth. Applied only at
+            export time; the recorded raw edges are unaffected, so the same
+            tracking run can produce reports at multiple depths.
+        ignore_stdlib:  bool
+            When True (default), standard-library modules are omitted from the
+            recorded tree.
 
     Returns:
         import_mapping:  Union[Dict[str, List[str]], Dict[str, Dict[str, Any]]]
@@ -69,6 +83,19 @@ def track_module(
 
     # Recursively build the mapping
     module_deps_map = dict()
+
+    # Resolve the set of trees that raw edges should be recorded into. Any
+    # enclosing track_imports context receives the edges, as does the local
+    # tree when track_tree is requested. Recording always keeps the raw edges;
+    # depth truncation is deferred to export.
+    tree_targets: List[DependencyTree] = []
+    enclosing_tree = active_tree()
+    if enclosing_tree is not None:
+        tree_targets.append(enclosing_tree)
+    local_tree: Optional[DependencyTree] = None
+    if track_tree:
+        local_tree = DependencyTree(name=full_module_name, ignore_stdlib=ignore_stdlib)
+        tree_targets.append(local_tree)
     modules_to_check = {imported}
     checked_modules = set()
     tracked_module_root_pkg = full_module_name.partition(".")[0]
@@ -93,6 +120,23 @@ def track_module(
             non_std_module_imports = [
                 mod for mod in all_imports if mod.__name__ in non_std_module_names
             ]
+
+            # Record the raw, directed import edges. This is idempotent at the
+            # DependencyTree level, so repeated imports, self references and
+            # cycles never create duplicate edges or recurse uncontrollably.
+            for import_mod in all_imports:
+                is_optional = import_mod in opt_dep_names
+                for dep_tree in tree_targets:
+                    if (
+                        dep_tree.ignore_stdlib
+                        and import_mod.__name__ not in non_std_module_names
+                    ):
+                        continue
+                    dep_tree.add_edge(
+                        module_to_check.__name__,
+                        import_mod.__name__,
+                        optional=is_optional,
+                    )
 
             # Set the deps for this module as a mapping from each dep to its
             # optional status
@@ -217,6 +261,17 @@ def track_module(
                 ] = optional_mapping.get(dep_name, False)
 
     log.debug("Final output: %s", deps_out)
+
+    # When tree tracking was requested, truncate at export time only and return
+    # the structured tree. The raw edges recorded on the tree are left intact.
+    if local_tree is not None:
+        log.debug(
+            "Exporting dependency tree for %s (max_depth=%s)",
+            full_module_name,
+            max_depth,
+        )
+        return local_tree.export(full_module_name, max_depth=max_depth)
+
     return deps_out
 
 

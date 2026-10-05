@@ -44,6 +44,23 @@ The main supports the following additional arguments:
 -   `--detect_transitive`: Mark each dependency as either "direct" (imported directly) or "transitive" (inherited from a direct import)
 -   `--full_depth`: Track all dependencies, including transitive dependencies of direct third-party deps
 -   `--show_optional`: Show whether each dependency is optional or required
+-   `--tree`: Output a dependency tree (nodes plus directed, de-duplicated edges) as JSON instead of the flattened dependency mapping
+-   `--depth`: With `--tree`, truncate the exported tree at the given relative depth (frontier nodes are kept and marked `truncated`; use `0` to export only the root). Truncation happens only at export time, so the recorded raw edges can produce reports at many depths
+-   `--html PATH`: With `--tree`, also write a self-contained HTML tree report that can be opened directly in a browser. Back edges (self references and import cycles) are explicitly marked
+-   `--include_stdlib`: With `--tree`, include standard-library modules as tree nodes (they are ignored by default)
+
+### Dependency tree and nested tracking
+
+The `import_tracker.track_imports` context manager records a dependency tree for
+all tracking performed inside it. Contexts may be nested; each context owns an
+independent tree, and if an inner context raises the active-context state is
+restored on the way out so the outer context still exits cleanly.
+
+Edge creation is idempotent: repeated imports, module self references and
+`A -> B -> A` cycles never create duplicate edges and never recurse out of
+control. The recorded tree keeps the raw edges; depth truncation is applied
+only when exporting, allowing a single recorded tree to produce reports at
+multiple depths.
 
 ## Integrating `import_tracker` into a project
 

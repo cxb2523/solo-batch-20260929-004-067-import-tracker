@@ -5,5 +5,6 @@ tracks their third party deps
 
 # Local
 from . import setup_tools
+from .dependency_tree import track_imports
 from .import_tracker import track_module
 from .lazy_import_errors import lazy_import_errors

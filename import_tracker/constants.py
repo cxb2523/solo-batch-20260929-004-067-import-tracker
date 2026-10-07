@@ -16,3 +16,14 @@ TYPE_TRANSITIVE = "transitive"
 INFO_TYPE = "type"
 INFO_STACK = "stack"
 INFO_OPTIONAL = "optional"
+
+## Dependency Tree #############################################################
+
+# The default maximum depth used when exporting a dependency tree. When None,
+# the tree is exported without any depth truncation. Note that this only
+# applies at export time; recording always keeps the raw edges.
+MAX_DEPTH = None
+
+# Switch controlling whether standard library modules are ignored when
+# recording dependency tree edges
+IGNORE_STDLIB = True

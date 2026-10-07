@@ -138,3 +138,63 @@ def test_lib_with_lazy_imports(capsys):
     assert captured.out
     parsed_out = json.loads(captured.out)
     assert "lazy_import_errors" in parsed_out
+
+
+def test_tree_export(capsys):
+    """Run the main entrypoint in tree mode and check the exported JSON"""
+    with cli_args("--name", "sample_lib.submod1", "--tree", "--depth", "2"):
+        main()
+    captured = capsys.readouterr()
+    assert captured.out
+    parsed_out = json.loads(captured.out)
+    assert parsed_out["max_depth"] == 2
+    assert parsed_out["roots"] == ["sample_lib.submod1"]
+    assert "sample_lib.submod1" in parsed_out["nodes"]
+    # Each node maintains its in/out edges and relative depth
+    root_info = parsed_out["nodes"]["sample_lib.submod1"]
+    assert root_info["depth"] == 0
+    assert "conditional_deps" in root_info["out"]
+    assert "sample_lib.submod1" in parsed_out["nodes"]["conditional_deps"]["in"]
+    # The raw edges are exported alongside the per-node info
+    assert ["sample_lib.submod1", "conditional_deps"] in parsed_out["edges"]
+
+
+def test_tree_export_default_name(capsys):
+    """In tree mode without a --name, the import_tracker package itself is
+    tracked
+    """
+    with cli_args("--tree", "--depth", "1"):
+        main()
+    captured = capsys.readouterr()
+    assert captured.out
+    parsed_out = json.loads(captured.out)
+    assert parsed_out["roots"] == [constants.THIS_PACKAGE]
+    assert parsed_out["max_depth"] == 1
+
+
+def test_tree_export_html(capsys, tmp_path):
+    """The --html flag writes a standalone HTML report of the tree"""
+    html_path = os.path.join(str(tmp_path), "tree.html")
+    with cli_args(
+        "--name", "sample_lib.submod1", "--tree", "--depth", "0", "--html", html_path
+    ):
+        main()
+    captured = capsys.readouterr()
+    assert captured.out
+    parsed_out = json.loads(captured.out)
+    assert parsed_out["max_depth"] == 0
+    # Depth 0 truncates everything beyond the root, but the raw edges remain
+    assert parsed_out["nodes"]["conditional_deps"]["truncated"] is True
+    assert ["sample_lib.submod1", "conditional_deps"] in parsed_out["edges"]
+    assert os.path.exists(html_path)
+    with open(html_path, encoding="utf-8") as handle:
+        content = handle.read()
+    assert "sample_lib.submod1" in content
+    assert "truncated" in content
+
+
+def test_name_required_without_tree(capsys):
+    """Without --tree, the --name argument is still required"""
+    with cli_args():
+        with pytest.raises(SystemExit):
+            main()

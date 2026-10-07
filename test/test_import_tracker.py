@@ -289,6 +289,7 @@ def test_detect_transitive_with_nested_module_full_depth():
             "sample_lib": {"type": constants.TYPE_DIRECT},
             "yaml": {"type": constants.TYPE_TRANSITIVE},
             "conditional_deps": {"type": constants.TYPE_TRANSITIVE},
+            "typing_extensions": {"type": constants.TYPE_TRANSITIVE},
         },
         "direct_dep_nested.nested": {
             "sample_lib": {"type": constants.TYPE_DIRECT},
@@ -299,6 +300,7 @@ def test_detect_transitive_with_nested_module_full_depth():
             "alog": {"type": constants.TYPE_DIRECT},
             "sample_lib": {"type": constants.TYPE_TRANSITIVE},
             "conditional_deps": {"type": constants.TYPE_TRANSITIVE},
+            "typing_extensions": {"type": constants.TYPE_TRANSITIVE},
         },
     }
 
@@ -386,6 +388,7 @@ def test_upstream_optional_deps():
             "yaml": {"optional": True},
             "alog": {"optional": True},
             "single_extra": {"optional": True},
+            "typing_extensions": {"optional": True},
         },
     }
 

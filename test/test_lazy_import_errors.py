@@ -273,11 +273,13 @@ class Bar:
 """
             )
         out, _ = subprocess.Popen(
-            shlex.split(
-                f"{sys.executable} -c 'from some_module import Foo; import pickle; print(pickle.dumps(Foo()).hex())'"
-            ),
+            [
+                sys.executable,
+                "-c",
+                "from some_module import Foo; import pickle; print(pickle.dumps(Foo()).hex())",
+            ],
             stdout=subprocess.PIPE,
-            env={"PYTHONPATH": workdir},
+            env={**os.environ, "PYTHONPATH": workdir},
         ).communicate()
 
     # Import the missing module

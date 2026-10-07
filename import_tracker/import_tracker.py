@@ -3,10 +3,15 @@ This module implements utilities that enable tracking of third party deps
 through import statements
 """
 # Standard
+from collections import deque
+from contextlib import contextmanager
 from types import ModuleType
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+import builtins
 import dis
+import html as html_lib
 import importlib
+import inspect
 import os
 import re
 import sys
@@ -26,6 +31,7 @@ def track_module(
     full_depth: bool = False,
     detect_transitive: bool = False,
     show_optional: bool = False,
+    ignore_stdlib: Optional[bool] = None,
 ) -> Union[Dict[str, List[str]], Dict[str, Dict[str, Any]]]:
     """Track the dependencies of a single python module
 
@@ -51,6 +57,11 @@ def track_module(
         show_optional:  bool
             Show whether each requirement is optional (behind a try/except) or
             not
+        ignore_stdlib:  Optional[bool]
+            Whether standard library modules are ignored when recording
+            dependency tree edges. Defaults to constants.IGNORE_STDLIB. This
+            only affects the recorded dependency tree (see get_last_tree); the
+            returned dependency mapping always excludes standard libs.
 
     Returns:
         import_mapping:  Union[Dict[str, List[str]], Dict[str, Dict[str, Any]]]
@@ -61,11 +72,17 @@ def track_module(
             "type" keys respectively. If neither feature is enabled, the schema
             is Dict[str, List[str]].
     """
+    if ignore_stdlib is None:
+        ignore_stdlib = constants.IGNORE_STDLIB
 
     # Import the target module
     log.debug("Importing %s.%s", package_name, module_name)
     imported = importlib.import_module(module_name, package=package_name)
     full_module_name = imported.__name__
+
+    # Start a fresh dependency tree rooted at the target module
+    tree = ImportTree()
+    tree.add_root(full_module_name)
 
     # Recursively build the mapping
     module_deps_map = dict()
@@ -86,6 +103,14 @@ def track_module(
                 module_to_check.__name__,
                 module_import_names,
             )
+
+            # Record the raw dependency tree edges for this module. This is
+            # idempotent: repeated imports, self references and cycles only
+            # ever produce a single edge between the same two nodes.
+            for imported_mod in all_imports:
+                if ignore_stdlib and _is_stdlib_module(imported_mod.__name__):
+                    continue
+                tree.add_import(module_to_check.__name__, imported_mod.__name__)
 
             # Trim to just non-standard modules
             non_std_module_names = _get_non_std_modules(module_import_names)
@@ -121,6 +146,20 @@ def track_module(
                 }
             )
 
+            # Always traverse modules within the tracked root package so that
+            # the dependency tree captures the internal structure even when
+            # the tracked library is this package itself
+            next_modules_to_check = next_modules_to_check.union(
+                {
+                    mod
+                    for mod in all_imports
+                    if (
+                        mod not in checked_modules
+                        and mod.__name__.partition(".")[0] == tracked_module_root_pkg
+                    )
+                }
+            )
+
             # Also check modules with intermediate names
             parent_mods = set()
             for mod in next_modules_to_check:
@@ -149,6 +188,10 @@ def track_module(
         modules_to_check = next_modules_to_check
 
     log.debug3("Full module dep mapping: %s", module_deps_map)
+
+    # Expose the recorded dependency tree for export
+    global _last_tree
+    _last_tree = tree
 
     # Determine all the modules we want the final answer for
     output_mods = {full_module_name}
@@ -220,7 +263,398 @@ def track_module(
     return deps_out
 
 
+## Dependency Tree #############################################################
+
+# The most recently recorded dependency tree (from track_module or
+# track_imports). Recording always keeps the raw edges; depth truncation only
+# happens when the tree is exported.
+_last_tree = None
+
+
+class ImportTree:
+    """A dependency tree recording the raw import edges between modules.
+
+    Each tracked module is a node that maintains its in-edges and out-edges.
+    Edge creation is idempotent: repeated imports, module self references and
+    circular imports (A -> B -> A) never produce duplicate edges, and all
+    traversals are iterative with visited tracking so cycles cannot cause
+    runaway recursion.
+    """
+
+    def __init__(self):
+        # Raw edges as (importer, imported) pairs
+        self.edges = set()
+        # Adjacency maps from module name to the set of connected names
+        self.out_edges = {}
+        self.in_edges = {}
+        # Ordered root module names (relative depth 0)
+        self.roots = []
+
+    @property
+    def nodes(self) -> Set[str]:
+        """All tracked module names"""
+        return set(self.out_edges.keys())
+
+    def _ensure_node(self, name: str):
+        self.out_edges.setdefault(name, set())
+        self.in_edges.setdefault(name, set())
+
+    def add_root(self, name: str):
+        """Register a root node (relative depth 0)"""
+        self._ensure_node(name)
+        if name not in self.roots:
+            self.roots.append(name)
+
+    def add_edge(self, source: str, target: str) -> bool:
+        """Idempotently add a single edge from source to target. Self edges
+        are recorded once like any other edge.
+        """
+        self._ensure_node(source)
+        self._ensure_node(target)
+        if (source, target) in self.edges:
+            return False
+        self.edges.add((source, target))
+        self.out_edges[source].add(target)
+        self.in_edges[target].add(source)
+        return True
+
+    def add_import(self, importer: str, imported: str):
+        """Record that the importer imported the given dotted module name.
+
+        Importing a dotted name also imports each of its parent packages, so
+        edges are recorded for the full name and every parent prefix that is
+        present in sys.modules.
+        """
+        name_parts = imported.split(".")
+        for idx in range(len(name_parts)):
+            prefix = ".".join(name_parts[: idx + 1])
+            if prefix in sys.modules:
+                self.add_edge(importer, prefix)
+
+    def depths(self) -> Dict[str, Optional[int]]:
+        """Compute the relative depth of each node from the roots using an
+        iterative breadth-first traversal (cycle safe).
+        """
+        # Roots plus any node with no incoming edges start at depth 0
+        starts = list(self.roots) + sorted(
+            node
+            for node in self.nodes
+            if node not in self.roots and not self.in_edges.get(node)
+        )
+        depth_map = {}
+        queue = deque()
+        for start in starts:
+            if start not in depth_map:
+                depth_map[start] = 0
+                queue.append(start)
+        while queue:
+            node = queue.popleft()
+            for child in sorted(self.out_edges.get(node, ())):
+                if child not in depth_map:
+                    depth_map[child] = depth_map[node] + 1
+                    queue.append(child)
+        # Any node still unreachable (e.g. only reachable through cycles with
+        # no entry point) gets no relative depth
+        for node in self.nodes:
+            depth_map.setdefault(node, None)
+        return depth_map
+
+    def cycle_edges(self) -> Set[Tuple[str, str]]:
+        """Find the edges that close a cycle (including self edges) using an
+        iterative depth-first traversal.
+        """
+        back_edges = set()
+        done = set()
+        starts = list(self.roots) + sorted(self.nodes)
+        for start in starts:
+            if start in done:
+                continue
+            in_path = {start}
+            stack = [(start, sorted(self.out_edges.get(start, ())))]
+            while stack:
+                node, children = stack[-1]
+                descended = False
+                while children:
+                    child = children.pop()
+                    if child in in_path:
+                        back_edges.add((node, child))
+                    elif child not in done:
+                        in_path.add(child)
+                        stack.append((child, sorted(self.out_edges.get(child, ()))))
+                        descended = True
+                        break
+                if not descended:
+                    done.add(node)
+                    in_path.discard(node)
+                    stack.pop()
+        return back_edges
+
+    def to_dict(self, max_depth: Optional[int] = None) -> Dict[str, Any]:
+        """Export the tree as a JSON-serializable mapping.
+
+        Depth truncation happens only here, at export time: the raw edges are
+        always exported in full and nodes beyond max_depth are kept and marked
+        as truncated, so the same recording can produce reports at multiple
+        depth settings.
+        """
+        if max_depth is None:
+            max_depth = constants.MAX_DEPTH
+        depth_map = self.depths()
+        nodes = {}
+        for name in sorted(self.nodes):
+            depth = depth_map.get(name)
+            nodes[name] = {
+                "depth": depth,
+                "in": sorted(self.in_edges.get(name, ())),
+                "out": sorted(self.out_edges.get(name, ())),
+                "truncated": bool(
+                    max_depth is not None and depth is not None and depth > max_depth
+                ),
+            }
+        return {
+            "roots": list(self.roots),
+            "max_depth": max_depth,
+            "nodes": nodes,
+            "edges": sorted([list(edge) for edge in self.edges]),
+            "cycles": sorted([list(edge) for edge in self.cycle_edges()]),
+        }
+
+    def render_html(self, max_depth: Optional[int] = None) -> str:
+        """Render the tree as a standalone, directly openable HTML report"""
+        report = self.to_dict(max_depth=max_depth)
+        max_depth = report["max_depth"]
+        nodes = report["nodes"]
+        cycle_edges = {tuple(edge) for edge in report["cycles"]}
+        depth_map = {name: info["depth"] for name, info in nodes.items()}
+
+        def render_node(name: str, path: Tuple[str, ...]) -> List[str]:
+            depth = depth_map.get(name)
+            depth_label = "?" if depth is None else str(depth)
+            lines = [
+                "<li><code>{}</code> "
+                '<span class="depth">[depth {}]</span>'.format(
+                    html_lib.escape(name), depth_label
+                )
+            ]
+            child_lines = []
+            for child in sorted(self.out_edges.get(name, ())):
+                escaped_child = html_lib.escape(child)
+                if (name, child) in cycle_edges or child in path:
+                    child_lines.append(
+                        "<li><code>{}</code> "
+                        '<span class="cycle">&#8617; cycle</span></li>'.format(
+                            escaped_child
+                        )
+                    )
+                elif nodes.get(child, {}).get("truncated"):
+                    child_lines.append(
+                        "<li><code>{}</code> "
+                        '<span class="truncated">&#8230; truncated '
+                        "(depth &gt; {})</span></li>".format(escaped_child, max_depth)
+                    )
+                else:
+                    child_lines.extend(render_node(child, path + (name,)))
+            if child_lines:
+                lines.append("<ul>")
+                lines.extend(child_lines)
+                lines.append("</ul>")
+            lines.append("</li>")
+            return lines
+
+        body_lines = []
+        roots = report["roots"] or sorted(
+            name for name, info in nodes.items() if not info["in"]
+        )
+        body_lines.append("<ul>")
+        for root in roots:
+            body_lines.extend(render_node(root, ()))
+        body_lines.append("</ul>")
+
+        cycle_lines = ""
+        if report["cycles"]:
+            cycle_items = "\n".join(
+                "<li><code>{}</code> &#8594; <code>{}</code></li>".format(
+                    html_lib.escape(src), html_lib.escape(dst)
+                )
+                for src, dst in report["cycles"]
+            )
+            cycle_lines = "<h2>Cycle Edges</h2>\n<ul>\n{}\n</ul>".format(cycle_items)
+
+        return _TREE_HTML_TEMPLATE.format(
+            node_count=len(nodes),
+            edge_count=len(report["edges"]),
+            max_depth="unlimited" if max_depth is None else max_depth,
+            tree="\n".join(body_lines),
+            cycles=cycle_lines,
+        )
+
+    def write_html(self, path: str, max_depth: Optional[int] = None):
+        """Write the standalone HTML report to the given file path"""
+        parent_dir = os.path.dirname(os.path.abspath(path))
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(self.render_html(max_depth=max_depth))
+
+
+_TREE_HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Import Dependency Tree</title>
+<style>
+body {{ font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+       margin: 2em; color: #24292f; }}
+code {{ background: #f6f8fa; padding: 0.1em 0.4em; border-radius: 4px; }}
+ul {{ list-style: none; border-left: 1px solid #d0d7de; padding-left: 1.5em; }}
+li {{ margin: 0.25em 0; }}
+.depth {{ color: #57606a; font-size: 0.85em; }}
+.cycle {{ color: #cf222e; font-weight: bold; }}
+.truncated {{ color: #6e7781; font-style: italic; }}
+.summary {{ color: #57606a; }}
+</style>
+</head>
+<body>
+<h1>Import Dependency Tree</h1>
+<p class="summary">Nodes: {node_count} | Edges: {edge_count} | Max depth: {max_depth}</p>
+{tree}
+{cycles}
+</body>
+</html>
+"""
+
+
+def get_last_tree() -> Optional[ImportTree]:
+    """Get the most recently recorded dependency tree"""
+    return _last_tree
+
+
+@contextmanager
+def track_imports(
+    roots: Optional[List[str]] = None,
+    ignore_stdlib: Optional[bool] = None,
+) -> ImportTree:
+    """Context manager that records a dependency tree of the imports that
+    happen inside its body.
+
+    Args:
+        roots:  Optional[List[str]]
+            The module names to use as tree roots (relative depth 0). If not
+            given, the module that entered the context is used.
+        ignore_stdlib:  Optional[bool]
+            Whether standard library modules are ignored when recording edges.
+            Defaults to constants.IGNORE_STDLIB.
+
+    Yields:
+        tree:  ImportTree
+            The tree being recorded. Raw edges only; depth truncation happens
+            at export time.
+
+    Notes:
+        Contexts may be nested. Each exit restores the __import__ hook that
+        was in place when it was entered, so an exception raised inside an
+        inner context still leaves the outer context's state intact.
+    """
+    if ignore_stdlib is None:
+        ignore_stdlib = constants.IGNORE_STDLIB
+    tree = ImportTree()
+    root_names = list(roots) if roots else []
+    if not root_names:
+        caller_name = _external_caller_name()
+        if caller_name:
+            root_names.append(caller_name)
+    for root_name in root_names:
+        tree.add_root(root_name)
+
+    # Save the current import hook so it can be restored on exit, no matter
+    # how the body terminates
+    prev_import = builtins.__import__
+
+    def _tracking_import(name, globals=None, locals=None, fromlist=(), level=0):
+        module = prev_import(name, globals, locals, fromlist, level)
+
+        # Figure out who is doing the importing
+        importer = (globals or {}).get("__name__") or _external_caller_name()
+
+        # Resolve relative imports against the caller's package
+        abs_name = name
+        if level:
+            package = (globals or {}).get("__package__") or ""
+            package_parts = package.split(".") if package else []
+            if level > 1:
+                keep = len(package_parts) - (level - 1)
+                package_parts = package_parts[: max(keep, 0)]
+            abs_name = ".".join(package_parts + ([name] if name else []))
+
+        # Record the import itself plus any fromlist entries that resolve to
+        # imported submodules
+        targets = [abs_name] if abs_name else []
+        if abs_name:
+            for from_item in fromlist or ():
+                candidate = f"{abs_name}.{from_item}"
+                if candidate in sys.modules:
+                    targets.append(candidate)
+        for target in targets:
+            if target.partition(".")[0] not in sys.modules:
+                continue
+            if ignore_stdlib and _is_stdlib_module(target):
+                continue
+            if importer:
+                tree.add_import(importer, target)
+        return module
+
+    builtins.__import__ = _tracking_import
+    global _last_tree
+    _last_tree = tree
+    try:
+        yield tree
+    finally:
+        builtins.__import__ = prev_import
+
+
 ## Private #####################################################################
+
+
+def _is_stdlib_module(mod_name: str) -> bool:
+    """Detect whether the given module name belongs to the standard library"""
+    if mod_name in sys.builtin_module_names:
+        return True
+    if mod_name.partition(".")[0] in _known_std_pkgs:
+        return True
+    mod = sys.modules.get(mod_name)
+    if mod is None:
+        return False
+    mod_file = getattr(mod, "__file__", None)
+    if mod_file is None:
+        # Builtins and frozen modules have no __file__
+        return True
+    real_file = os.path.normcase(os.path.realpath(mod_file))
+    # Anything under a site/dist-packages directory is third party, even
+    # though such directories live under the standard library dir
+    path_parts = set(os.path.normpath(real_file).split(os.sep))
+    if "site-packages" in path_parts or "dist-packages" in path_parts:
+        return False
+    # The module is standard if its file lives under the stdlib directories
+    return any(
+        real_file.startswith(os.path.normcase(std_dir) + os.sep)
+        for std_dir in [_std_lib_dir, _std_dylib_dir]
+    )
+
+
+def _external_caller_name() -> Optional[str]:
+    """Walk up the stack to find the name of the first module outside of this
+    module and the contextlib machinery.
+    """
+    frame = inspect.currentframe()
+    try:
+        while frame is not None:
+            mod_name = frame.f_globals.get("__name__", "")
+            if mod_name and mod_name not in (__name__, "contextlib"):
+                return mod_name
+            frame = frame.f_back
+        return None
+    finally:
+        del frame
 
 
 def _get_dylib_dir():
